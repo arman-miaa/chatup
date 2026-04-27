@@ -41,7 +41,16 @@ export default function ChatPage() {
   const wsRef = useRef<WebSocket | null>(null);
 
   const [allUsers, setAllUsers] = useState<User[]>([]);
-  const [selectedUser, setSelectedUser] = useState<User | null>(null);
+
+  // ✅ localStorage থেকে selectedUser restore করো
+  const [selectedUser, setSelectedUser] = useState<User | null>(() => {
+    if (typeof window !== "undefined") {
+      const saved = localStorage.getItem("selectedChatUser");
+      return saved ? JSON.parse(saved) : null;
+    }
+    return null;
+  });
+
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [messageInput, setMessageInput] = useState("");
   const [typingUser, setTypingUser] = useState<string>("");
@@ -61,6 +70,15 @@ export default function ChatPage() {
   useEffect(() => {
     scrollToBottom();
   }, [chatMessages, scrollToBottom]);
+
+  // ✅ selectedUser change হলে localStorage-এ save করো
+  useEffect(() => {
+    if (selectedUser) {
+      localStorage.setItem("selectedChatUser", JSON.stringify(selectedUser));
+    } else {
+      localStorage.removeItem("selectedChatUser");
+    }
+  }, [selectedUser]);
 
   // Auto-connect WebSocket
   useEffect(() => {
@@ -86,6 +104,13 @@ export default function ChatPage() {
             if (websocket.readyState === WebSocket.OPEN) {
               websocket.send(JSON.stringify({ event: "fetchAllUsers" }));
               websocket.send(JSON.stringify({ event: "messageList" }));
+              
+              // ✅ যদি saved selectedUser থাকে, তাহলে fetchChats পাঠাও
+              const savedUser = localStorage.getItem("selectedChatUser");
+              if (savedUser) {
+                const parsed = JSON.parse(savedUser);
+                websocket.send(JSON.stringify({ event: "fetchChats", receiverId: parsed.id }));
+              }
             }
           }, 500);
         };
@@ -93,7 +118,7 @@ export default function ChatPage() {
         websocket.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data);
-            console.log("📩 EVENT:", data.event);
+            console.log("📩 EVENT:", data.event, data.data ? "✅" : "");
             handleWebSocketMessage(data);
           } catch {
             console.log("Raw:", event.data);
@@ -175,13 +200,11 @@ export default function ChatPage() {
         break;
 
       case "fetchChats":
-        console.log("📥 fetchChats RAW data:", JSON.stringify(data.data));
+        console.log("📥 fetchChats:", data.data?.chats?.length, "messages");
         if (data.data?.chats && Array.isArray(data.data.chats)) {
-          console.log("✅ Setting", data.data.chats.length, "messages to chatMessages");
           setChatMessages(data.data.chats);
           setTimeout(scrollToBottom, 100);
         } else {
-          console.log("⚠️ No chats array, setting empty. Data:", data.data);
           setChatMessages([]);
         }
         break;
@@ -193,11 +216,53 @@ export default function ChatPage() {
           return [...prev, data.data];
         });
         setTimeout(scrollToBottom, 100);
-        
-        // Refresh sidebarde
+
         if (wsRef.current?.readyState === WebSocket.OPEN) {
           wsRef.current.send(JSON.stringify({ event: "messageList" }));
         }
+        break;
+
+      // ✅✅✅ FIX 1: messageSeen & messagesSeen হ্যান্ডলার
+      case "messageSeen":
+        console.log("👁️ messageSeen:", data.data.messageId);
+        setChatMessages((prev) =>
+          prev.map((msg) =>
+            msg.id === data.data.messageId ? { ...msg, isRead: true } : msg
+          )
+        );
+        break;
+
+      case "messagesSeen":
+        console.log("👁️ messagesSeen: ALL");
+        setChatMessages((prev) => prev.map((msg) => ({ ...msg, isRead: true })));
+        break;
+
+      case "messageEdited":
+        setChatMessages((prev) =>
+          prev.map((msg) => (msg.id === data.data.id ? data.data : msg))
+        );
+        break;
+
+      case "messageDeleted":
+        if (data.data.deletedForEveryone) {
+          setChatMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === data.data.messageId
+                ? { ...msg, isDeleted: true, message: "This message was deleted" }
+                : msg
+            )
+          );
+        } else {
+          setChatMessages((prev) => prev.filter((msg) => msg.id !== data.data.messageId));
+        }
+        break;
+
+      case "messageReaction":
+        setChatMessages((prev) =>
+          prev.map((msg) =>
+            msg.id === data.data.messageId ? { ...msg, reaction: data.data.reaction } : msg
+          )
+        );
         break;
 
       case "typing":
@@ -230,45 +295,35 @@ export default function ChatPage() {
     );
   };
 
-  // Select user & fetch chat history
   const selectUser = (chatUser: User) => {
-    console.log("👆 SELECTED:", chatUser.fullName, chatUser.id);
-    
-    // Set selected user first
+    console.log("👆 SELECTED:", chatUser.fullName);
     setSelectedUser(chatUser);
-    
-    // Clear old messages
     setChatMessages([]);
-    
-    // Reset unread
     setAllUsers((prev) =>
       prev.map((u) => (u.id === chatUser.id ? { ...u, unreadCount: 0 } : u))
     );
 
-    // Fetch chat history
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      const payload = { event: "fetchChats", receiverId: chatUser.id };
-      console.log("📤 Sending:", payload);
-      wsRef.current.send(JSON.stringify(payload));
-    } else {
-      console.log("❌ WebSocket not open");
+      wsRef.current.send(JSON.stringify({ event: "fetchChats", receiverId: chatUser.id }));
+      
+      // ✅ Mark all as seen when selecting user
+      wsRef.current.send(JSON.stringify({ event: "markAsSeen", markAll: true }));
     }
   };
 
-  // Send message
   const sendMessage = () => {
     if (!selectedUser || !messageInput.trim()) return;
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
-    const payload = {
-      event: "message",
-      receiverId: selectedUser.id,
-      message: messageInput.trim(),
-      images: [],
-    };
-    
-    console.log("📤 Sending message:", payload);
-    wsRef.current.send(JSON.stringify(payload));
+    wsRef.current.send(
+      JSON.stringify({
+        event: "message",
+        receiverId: selectedUser.id,
+        message: messageInput.trim(),
+        images: [],
+      })
+    );
+
     setMessageInput("");
     messageInputRef.current?.focus();
   };
@@ -284,24 +339,25 @@ export default function ChatPage() {
     }
   };
 
-  const deleteMessage = (messageId: string, forEveryone = false) => {
-    if (!wsRef.current) return;
-    wsRef.current.send(
-      JSON.stringify({ event: "deleteMessage", messageId, deleteForEveryone: forEveryone })
-    );
-  };
+//   const deleteMessage = (messageId: string, forEveryone = false) => {
+//     if (!wsRef.current) return;
+//     wsRef.current.send(
+//       JSON.stringify({ event: "deleteMessage", messageId, deleteForEveryone: forEveryone })
+//     );
+//   };
 
-  const editMessage = (messageId: string, newMessage: string) => {
-    if (!wsRef.current) return;
-    wsRef.current.send(JSON.stringify({ event: "editMessage", messageId, newMessage }));
-  };
+//   const editMessage = (messageId: string, newMessage: string) => {
+//     if (!wsRef.current) return;
+//     wsRef.current.send(JSON.stringify({ event: "editMessage", messageId, newMessage }));
+//   };
 
-  const reactToMessage = (messageId: string, reaction: string) => {
-    if (!wsRef.current) return;
-    wsRef.current.send(JSON.stringify({ event: "reactToMessage", messageId, reaction }));
-  };
+//   const reactToMessage = (messageId: string, reaction: string) => {
+//     if (!wsRef.current) return;
+//     wsRef.current.send(JSON.stringify({ event: "reactToMessage", messageId, reaction }));
+//   };
 
   const formatTime = (dateString: string) => {
+    if (!dateString) return "";
     const date = new Date(dateString);
     const today = new Date();
     return date.toDateString() === today.toDateString()
@@ -318,7 +374,7 @@ export default function ChatPage() {
   // Not logged in
   if (!token && !isConnecting) {
     return (
-      <div className="h-screen flex items-center justify-center bg-gradient-to-br from-purple-600 to-blue-500">
+      <div className="h-screen flex items-center justify-center bg-linear-to-br from-purple-600 to-blue-500">
         <div className="bg-white rounded-2xl shadow-2xl p-8 w-full max-w-md text-center">
           <div className="text-6xl mb-4">🔒</div>
           <h2 className="text-2xl font-bold text-gray-800 mb-2">Login Required</h2>
@@ -380,11 +436,11 @@ export default function ChatPage() {
               className={`p-4 border-b border-gray-100 cursor-pointer hover:bg-gray-50 transition ${selectedUser?.id === chatUser.id ? "bg-purple-50 border-l-4 border-l-purple-600" : ""}`}
             >
               <div className="flex items-center gap-3">
-                <div className="relative flex-shrink-0">
+                <div className="relative shrink-0">
                   {chatUser.profileImage ? (
                     <Image src={chatUser.profileImage} alt={chatUser.fullName} width={48} height={48} className="rounded-full object-cover w-12 h-12" />
                   ) : (
-                    <div className="w-12 h-12 bg-gradient-to-br from-blue-400 to-blue-600 rounded-full flex items-center justify-center text-white font-bold text-lg">
+                    <div className="w-12 h-12 bg-linear-to-br from-blue-400 to-blue-600 rounded-full flex items-center justify-center text-white font-bold text-lg">
                       {chatUser.fullName?.charAt(0)?.toUpperCase() || "?"}
                     </div>
                   )}
@@ -398,7 +454,7 @@ export default function ChatPage() {
                   {chatUser.lastMessage && <p className="text-xs text-gray-500 truncate">{chatUser.lastMessage}</p>}
                 </div>
                 {chatUser.unreadCount > 0 && (
-                  <span className="bg-blue-600 text-white text-xs font-bold min-w-[20px] h-5 flex items-center justify-center rounded-full px-1">{chatUser.unreadCount}</span>
+                  <span className="bg-blue-600 text-white text-xs font-bold min-w-5 h-5 flex items-center justify-center rounded-full px-1">{chatUser.unreadCount}</span>
                 )}
               </div>
             </div>
@@ -410,7 +466,7 @@ export default function ChatPage() {
             {user?.profileImage ? (
               <Image src={user.profileImage} alt="You" width={40} height={40} className="rounded-full object-cover w-10 h-10" />
             ) : (
-              <div className="w-10 h-10 bg-gradient-to-br from-green-400 to-blue-500 rounded-full flex items-center justify-center text-white font-bold">
+              <div className="w-10 h-10 bg-linear-to-br from-green-400 to-blue-500 rounded-full flex items-center justify-center text-white font-bold">
                 {user?.fullName?.charAt(0)?.toUpperCase() || "Y"}
               </div>
             )}
@@ -432,7 +488,7 @@ export default function ChatPage() {
                   {selectedUser.profileImage ? (
                     <Image src={selectedUser.profileImage} alt={selectedUser.fullName} width={40} height={40} className="rounded-full object-cover w-10 h-10" />
                   ) : (
-                    <div className="w-10 h-10 bg-gradient-to-br from-blue-400 to-blue-600 rounded-full flex items-center justify-center text-white font-bold">
+                    <div className="w-10 h-10 bg-linear-to-br from-blue-400 to-blue-600 rounded-full flex items-center justify-center text-white font-bold">
                       {selectedUser.fullName?.charAt(0)?.toUpperCase()}
                     </div>
                   )}
@@ -443,14 +499,19 @@ export default function ChatPage() {
                   <p className="text-xs text-gray-500">{typingUser === selectedUser.id ? "Typing..." : selectedUser.isOnline ? "Online" : "Offline"}</p>
                 </div>
               </div>
+              {/* ✅ Close button */}
+              <button
+                onClick={() => {
+                  setSelectedUser(null);
+                  localStorage.removeItem("selectedChatUser");
+                }}
+                className="ml-auto text-gray-400 hover:text-gray-600 text-xl"
+              >
+                ✕
+              </button>
             </div>
 
             <div className="flex-1 overflow-y-auto px-6 py-4 space-y-3 bg-[#E5DDD5] bg-opacity-50">
-              {/* DEBUG */}
-              <div style={{fontSize:"10px",color:"gray",textAlign:"center"}}>
-                Messages: {chatMessages.length} | Selected: {selectedUser.fullName}
-              </div>
-              
               {chatMessages.length === 0 ? (
                 <div className="flex items-center justify-center h-full text-gray-400">
                   <div className="text-center">
@@ -471,7 +532,16 @@ export default function ChatPage() {
                       </div>
                       <div className={`flex items-center gap-1 mt-1 px-1 ${msg.senderId === user?.id ? "justify-end" : "justify-start"}`}>
                         <span className="text-[10px] text-gray-400">{formatTime(msg.createdAt)}</span>
-                        {msg.senderId === user?.id && <span className="text-[10px] text-blue-400">{msg.isRead ? "✓✓" : "✓"}</span>}
+                        {/* ✅✅✅ DOUBLE TICK */}
+                        {msg.senderId === user?.id && (
+                          <span className="text-[10px]">
+                            {msg.isRead ? (
+                              <span className="text-blue-500">✓✓</span>
+                            ) : (
+                              <span className="text-gray-400">✓</span>
+                            )}
+                          </span>
+                        )}
                       </div>
                     </div>
                   </div>
